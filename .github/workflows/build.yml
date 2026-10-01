@@ -1,0 +1,179 @@
+# Web2APK cloud build. Put this file in a GitHub repo at .github/workflows/build.yml
+# The PHP site triggers it, the job downloads the generated project from your site,
+# builds it, and uploads the results back to your site.
+name: Web2APK build
+run-name: Web2APK build ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job id
+        required: true
+        type: string
+      token:
+        description: Per-job callback token
+        required: true
+        type: string
+      base_url:
+        description: Base URL of the Web2APK site
+        required: true
+        type: string
+      do_android:
+        description: Build Android
+        required: true
+        default: 'true'
+        type: string
+      do_ios:
+        description: Build iOS
+        required: true
+        default: 'false'
+        type: string
+      android_tasks:
+        description: Gradle tasks
+        required: true
+        default: 'assembleRelease bundleRelease'
+        type: string
+
+jobs:
+  android:
+    if: ${{ inputs.do_android == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      TOKEN: ${{ inputs.token }}
+      BASE_URL: ${{ inputs.base_url }}
+      TASKS: ${{ inputs.android_tasks }}
+      CALLBACK: ${{ inputs.base_url }}/api/callback.php
+    steps:
+      - name: Mask token
+        run: echo "::add-mask::$TOKEN"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.5'
+
+      - name: Report start
+        run: |
+          curl -sS -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
+            -F platform=android -F status=running -F "message=Compiling the Android app..." || true
+
+      - name: Download project
+        run: |
+          curl -fsSL -o android.zip "$BASE_URL/api/download.php?job=$JOB_ID&file=android_src"
+          mkdir proj
+          unzip -q android.zip -d proj
+
+      - name: Prepare signing key
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KS_PASS_S: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS_S: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS_S: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/sign"
+          KS="$RUNNER_TEMP/sign/release.jks"
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$KS"
+            ALIAS="$KEY_ALIAS_S"; SP="$KS_PASS_S"; KP="${KEY_PASS_S:-$KS_PASS_S}"; NEW=false
+          else
+            SP=$(openssl rand -hex 12); KP="$SP"; ALIAS=app; NEW=true
+            keytool -genkeypair -keystore "$KS" -storepass "$SP" -keypass "$KP" \
+              -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Web2APK App, O=Web2APK, C=US"
+            printf 'Keystore: release.jks\nAlias: %s\nStore password: %s\nKey password: %s\n' "$ALIAS" "$SP" "$KP" > "$RUNNER_TEMP/sign/credentials.txt"
+          fi
+          echo "::add-mask::$SP"
+          echo "::add-mask::$KP"
+          {
+            echo "KS_FILE=$KS"
+            echo "KS_PASS=$SP"
+            echo "KEY_ALIAS=$ALIAS"
+            echo "KEY_PASS=$KP"
+            echo "KS_NEW=$NEW"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: proj
+        run: |
+          gradle --no-daemon --stacktrace $TASKS \
+            -PKS_FILE="$KS_FILE" -PKS_PASS="$KS_PASS" -PKEY_ALIAS="$KEY_ALIAS" -PKEY_PASS="$KEY_PASS"
+
+      - name: Upload results to your site
+        run: |
+          ARGS=(-F job_id="$JOB_ID" -F token="$TOKEN" -F platform=android -F status=success -F "message=Android build finished.")
+          APK=$(find proj/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -1 || true)
+          AAB=$(find proj/app/build/outputs/bundle/release -name '*.aab' 2>/dev/null | head -1 || true)
+          if [ -n "$APK" ]; then ARGS+=(-F "apk=@$APK"); fi
+          if [ -n "$AAB" ]; then ARGS+=(-F "aab=@$AAB"); fi
+          if [ "$KS_NEW" = "true" ]; then
+            (cd "$RUNNER_TEMP/sign" && zip -q signing.zip release.jks credentials.txt)
+            ARGS+=(-F "signing=@$RUNNER_TEMP/sign/signing.zip")
+          fi
+          curl -fsS --retry 3 -X POST "$CALLBACK" "${ARGS[@]}"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -sS -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
+            -F platform=android -F status=failed \
+            -F "message=Build failed. Open the GitHub Actions run for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+
+  ios:
+    if: ${{ inputs.do_ios == 'true' }}
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      TOKEN: ${{ inputs.token }}
+      BASE_URL: ${{ inputs.base_url }}
+      CALLBACK: ${{ inputs.base_url }}/api/callback.php
+    steps:
+      - name: Mask token
+        run: echo "::add-mask::$TOKEN"
+
+      - name: Report start
+        run: |
+          curl -sS -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
+            -F platform=ios -F status=running -F "message=Compiling the iOS app..." || true
+
+      - name: Download project
+        run: |
+          curl -fsSL -o ios.zip "$BASE_URL/api/download.php?job=$JOB_ID&file=ios_src"
+          mkdir proj
+          unzip -q ios.zip -d proj
+
+      - name: Generate Xcode project
+        working-directory: proj
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Archive (unsigned)
+        working-directory: proj
+        run: |
+          xcodebuild archive -project App.xcodeproj -scheme App -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -archivePath build/App.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          mkdir -p Payload
+          cp -R build/App.xcarchive/Products/Applications/App.app Payload/
+          zip -qry app.ipa Payload
+
+      - name: Upload results to your site
+        run: |
+          curl -fsS --retry 3 -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
+            -F platform=ios -F status=success -F "message=Unsigned IPA ready. Sign it with your Apple certificate to install or publish." \
+            -F "ipa=@proj/app.ipa"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -sS -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
+            -F platform=ios -F status=failed \
+            -F "message=Build failed. Open the GitHub Actions run for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
