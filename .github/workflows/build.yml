@@ -1,8 +1,6 @@
-# Web2APK cloud build. Put this file in a GitHub repo at .github/workflows/build.yml
-# The PHP site triggers it, the job downloads the generated project from your site,
-# builds it, and uploads the results back to your site.
-name: Web2APK build
-run-name: Web2APK build ${{ inputs.job_id }}
+# Shacks Web2App cloud build. Lives in the build repo at .github/workflows/build.yml
+name: Shacks Web2App build
+run-name: Build ${{ inputs.job_id }}
 
 on:
   workflow_dispatch:
@@ -16,7 +14,7 @@ on:
         required: true
         type: string
       base_url:
-        description: Base URL of the Web2APK site
+        description: Base URL of the site
         required: true
         type: string
       do_android:
@@ -66,8 +64,8 @@ jobs:
 
       - name: Download project
         run: |
-          curl -fsSL -o android.zip "$BASE_URL/api/download.php?job=$JOB_ID&file=android_src"
           mkdir proj
+          curl -fsSL -o android.zip "$BASE_URL/api/download.php?job=$JOB_ID&file=android_src" 2>&1 | tee proj/build.log
           unzip -q android.zip -d proj
 
       - name: Prepare signing key
@@ -86,7 +84,7 @@ jobs:
             SP=$(openssl rand -hex 12); KP="$SP"; ALIAS=app; NEW=true
             keytool -genkeypair -keystore "$KS" -storepass "$SP" -keypass "$KP" \
               -alias "$ALIAS" -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Web2APK App, O=Web2APK, C=US"
+              -dname "CN=Shacks Web2App, O=Shacks Tech, C=UG"
             printf 'Keystore: release.jks\nAlias: %s\nStore password: %s\nKey password: %s\n' "$ALIAS" "$SP" "$KP" > "$RUNNER_TEMP/sign/credentials.txt"
           fi
           echo "::add-mask::$SP"
@@ -102,10 +100,11 @@ jobs:
       - name: Build
         working-directory: proj
         run: |
+          set -o pipefail
           gradle --no-daemon --stacktrace $TASKS \
-            -PKS_FILE="$KS_FILE" -PKS_PASS="$KS_PASS" -PKEY_ALIAS="$KEY_ALIAS" -PKEY_PASS="$KEY_PASS"
+            -PKS_FILE="$KS_FILE" -PKS_PASS="$KS_PASS" -PKEY_ALIAS="$KEY_ALIAS" -PKEY_PASS="$KEY_PASS" 2>&1 | tee build.log
 
-      - name: Upload results to your site
+      - name: Upload results
         run: |
           ARGS=(-F job_id="$JOB_ID" -F token="$TOKEN" -F platform=android -F status=success -F "message=Android build finished.")
           APK=$(find proj/app/build/outputs/apk/release -name '*.apk' 2>/dev/null | head -1 || true)
@@ -116,14 +115,22 @@ jobs:
             (cd "$RUNNER_TEMP/sign" && zip -q signing.zip release.jks credentials.txt)
             ARGS+=(-F "signing=@$RUNNER_TEMP/sign/signing.zip")
           fi
-          curl -fsS --retry 3 -X POST "$CALLBACK" "${ARGS[@]}"
+          HTTP=$(curl -sS --retry 3 -o resp.txt -w '%{http_code}' -X POST "$CALLBACK" "${ARGS[@]}")
+          if [ "$HTTP" != "200" ]; then
+            echo "UPLOAD FAILED HTTP $HTTP: $(head -c 300 resp.txt)" | tee -a proj/build.log
+            exit 1
+          fi
 
       - name: Report failure
         if: failure()
         run: |
+          LOG=""
+          if [ -f proj/build.log ]; then
+            LOG=$(grep -E "error:|FAILED|What went wrong|Execution failed|Could not|UPLOAD FAILED|curl:" proj/build.log | tail -40 | cut -c1-300 || true)
+            [ -n "$LOG" ] || LOG=$(tail -30 proj/build.log | cut -c1-300)
+          fi
           curl -sS -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
-            -F platform=android -F status=failed \
-            -F "message=Build failed. Open the GitHub Actions run for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+            -F platform=android -F status=failed --form-string "message=Build failed." --form-string "log=$LOG" || true
 
   ios:
     if: ${{ inputs.do_ios == 'true' }}
@@ -145,35 +152,46 @@ jobs:
 
       - name: Download project
         run: |
-          curl -fsSL -o ios.zip "$BASE_URL/api/download.php?job=$JOB_ID&file=ios_src"
           mkdir proj
+          curl -fsSL -o ios.zip "$BASE_URL/api/download.php?job=$JOB_ID&file=ios_src" 2>&1 | tee proj/build.log
           unzip -q ios.zip -d proj
 
       - name: Generate Xcode project
         working-directory: proj
         run: |
-          brew install xcodegen
-          xcodegen generate
+          set -o pipefail
+          brew install xcodegen 2>&1 | tail -3
+          xcodegen generate 2>&1 | tee -a build.log
 
       - name: Archive (unsigned)
         working-directory: proj
         run: |
+          set -o pipefail
+          xcodebuild -version | tee -a build.log
           xcodebuild archive -project App.xcodeproj -scheme App -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -archivePath build/App.xcarchive \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee -a build.log | tail -n 30
           mkdir -p Payload
           cp -R build/App.xcarchive/Products/Applications/App.app Payload/
           zip -qry app.ipa Payload
 
-      - name: Upload results to your site
+      - name: Upload results
         run: |
-          curl -fsS --retry 3 -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
+          HTTP=$(curl -sS --retry 3 -o resp.txt -w '%{http_code}' -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
             -F platform=ios -F status=success -F "message=Unsigned IPA ready. Sign it with your Apple certificate to install or publish." \
-            -F "ipa=@proj/app.ipa"
+            -F "ipa=@proj/app.ipa")
+          if [ "$HTTP" != "200" ]; then
+            echo "UPLOAD FAILED HTTP $HTTP: $(head -c 300 resp.txt)" | tee -a proj/build.log
+            exit 1
+          fi
 
       - name: Report failure
         if: failure()
         run: |
+          LOG=""
+          if [ -f proj/build.log ]; then
+            LOG=$(grep -E "error:|error •|ARCHIVE FAILED|Command .* failed|UPLOAD FAILED|curl:|Error:" proj/build.log | tail -40 | cut -c1-300 || true)
+            [ -n "$LOG" ] || LOG=$(tail -30 proj/build.log | cut -c1-300)
+          fi
           curl -sS -X POST "$CALLBACK" -F job_id="$JOB_ID" -F token="$TOKEN" \
-            -F platform=ios -F status=failed \
-            -F "message=Build failed. Open the GitHub Actions run for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
+            -F platform=ios -F status=failed --form-string "message=Build failed." --form-string "log=$LOG" || true
